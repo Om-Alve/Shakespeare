@@ -1,10 +1,10 @@
-import json
-from utils import BytePairEncoder
+from minbpe.minbpe import BasicTokenizer
 
-
-# To load the model
-loaded_encoder = BytePairEncoder.load_model('vocab.json', 'merges.txt', 500)
-text = "hey this is om alve "
-print(loaded_encoder.encode(text))
-print(loaded_encoder.ids_to_token(loaded_encoder.encode(text)))
-print(loaded_encoder.decode(loaded_encoder.encode(text)))
+tokenizer = BasicTokenizer()
+with open("shakespeare.txt","r") as f:
+    text = f.read()
+tokenizer.train(text, 500) 
+text = "Hello world I am William Shakespeare."
+print(tokenizer.encode(text))
+print(tokenizer.decode(tokenizer.encode(text)))
+tokenizer.save("tokenizer")
