@@ -104,10 +104,8 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embed)
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        x = self.ln1(x)
-        x = x + self.sa_heads(x, training)
-        x = self.ln2(x)
-        return x + self.ffwd(x)
+        x = x + self.sa_heads(self.ln1(x), training)
+        return x + self.ffwd(self.ln2(x))
 
 class TransformerDecoder(nn.Module):
     def __init__(self, config :GPT2Config):
