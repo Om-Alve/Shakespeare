@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from utils import BytePairEncoder,GPT2Config
 from tqdm import tqdm
 from minbpe.minbpe import BasicTokenizer
+import einops
 
 batch_size = 64
 block_size = 64
@@ -16,7 +17,7 @@ eval_iters = 200
 n_embed = 512
 n_heads = 8
 n_layer = 3
-dropout = 0.2
+dropout = 0.05
 
 # torch.manual_seed(42)
 
@@ -67,38 +68,33 @@ class SwiGLU(nn.Module):
         out = self.dropout(self.w2(F.silu(self.w(x)) * self.v(x)))
         return out
 
-class Head(nn.Module):
-    def __init__(self, head_size: int, n_embed: int, dropout: float):
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_heads: int, n_embed: int, dropout: float):
         super().__init__()
-        self.qkv = nn.Linear(n_embed, 3 * head_size, bias=False)
+        self.n_embed = n_embed
+        self.head_size = n_embed // n_heads
+        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(n_embed, n_embed,bias=False)
         nn.init.xavier_uniform_(self.qkv.weight)
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
         B, T, C = x.shape
-        qkv = self.qkv(x).reshape(B, T, 3, -1).permute(0, 2, 1, 3)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        q,k,v = self.qkv(x).split(self.n_embed,dim=2)
+        q = einops.rearrange(q,'b t (nh hs) -> b nh t hs',nh=self.n_embed // self.head_size,hs=self.head_size)
+        k = einops.rearrange(k,'b t (nh hs) -> b nh t hs',nh=self.n_embed // self.head_size,hs=self.head_size)
+        v = einops.rearrange(v,'b t (nh hs) -> b nh t hs',nh=self.n_embed // self.head_size,hs=self.head_size)
         out = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=self.dropout.p if training else 0.0, is_causal=True
         )
-        return out
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads: int, head_size: int, n_embed: int, dropout: float):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size,n_embed, dropout) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embed, n_embed,bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, X: torch.Tensor, training: bool) -> torch.Tensor:
-        out = torch.cat([head(X, training) for head in self.heads], dim=-1)
+        out = einops.rearrange(out,"b nh t hs -> b t (nh hs)")
         out = self.proj(out)
-        return self.dropout(out)
+        return out
 
 class Block(nn.Module):
     def __init__(self, n_embed: int, n_heads: int, dropout: float):
         super().__init__()
-        self.sa_heads = MultiHeadAttention(n_heads, n_embed // n_heads, n_embed, dropout)
+        self.sa_heads = MultiHeadAttention(n_heads, n_embed, dropout)
         self.ffwd = SwiGLU(n_embed)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -120,8 +116,8 @@ class TransformerDecoder(nn.Module):
 
     def forward(self, x: torch.Tensor, training: bool = False) -> torch.Tensor:
         B, T = x.shape
-        tok_emb = self.embedding_table(x)
-        pos_emb = self.positon_embedding(torch.arange(T, device=x.device))
+        tok_emb = self.embedding_table(x) # (B, T, C)
+        pos_emb = self.positon_embedding(torch.arange(T, device=x.device,dtype=torch.long)) # (T, C)
         x = tok_emb + pos_emb
         for block in self.blocks:
             x = block(x, training)
@@ -140,21 +136,20 @@ if __name__ == '__main__':
     test_data = data[split:]
     config = GPT2Config(vocab_size=vocab_size,block_size=block_size,n_embed=n_embed,n_heads=n_heads,n_layers=n_layer,dropout=dropout,lr=learning_rate,t_max=max_iters)
     model = TransformerDecoder(config).to(device)
-    print("Total Params:",sum([p.numel() for p in model.parameters()]))
+    print("Total Params:",sum([p.numel() for p in model.parameters() if p.requires_grad]))
     print("Using",device)
     optimizer = torch.optim.Adam(model.parameters(),lr=learning_rate)
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=max_iters)
-
-    for iter in tqdm(range(max_iters+1)):
+    loader = tqdm(range(max_iters+1))
+    for iter in loader:
         x,y = get_batch("train")
         logits = model(x)
-        logits = logits.view(-1,logits.shape[-1])
+        logits = logits.view(-1, logits.size(-1))
         y = y.view(-1)
         loss = F.cross_entropy(logits,y)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        # scheduler.step()
+
         if iter % eval_interval == 0:
             with torch.inference_mode():
                 model.eval()
@@ -163,7 +158,7 @@ if __name__ == '__main__':
                 logits = logits.view(-1,logits.shape[-1])
                 y = y.view(-1)
                 loss = F.cross_entropy(logits,y)
-                tqdm.write(f"iter {iter} : loss = {loss.item():.4f}")
+                loader.set_postfix(loss=f"{loss.item():.4f}")
                 model.train()
-
+    
     torch.save(model.state_dict(),"model.pt")
